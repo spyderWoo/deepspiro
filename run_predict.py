@@ -1,166 +1,77 @@
-import argparse
-import os
+################################################################################
+# run_predict.py
+# 학습된 모델을 이용하여 새로운 샘플(CSV) 예측 스크립트
+################################################################################
 
+import argparse
+import yaml
+import numpy as np
+import pandas as pd
 import torch
 
-from utils.predict_utils import (
-    load_spiro_encoder,
-    preprocess_data,
-    run_spiro_encoder,
-    run_spiro_explainer,
-    load_cb_model,
-    run_spiro_predictor,
-)
+from utils.predict_utils import load_models, predict_copd
 
+def main():
+    parser = argparse.ArgumentParser(description="학습된 모델로 새로운 샘플 예측")
+    parser.add_argument("--input_csv",  type=str, required=True, help="예측할 샘플 CSV 경로")
+    parser.add_argument("--output_csv", type=str, required=True, help="예측 결과 저장 CSV 경로")
+    args = parser.parse_args()
 
-def parse_arguments(params=None):
-    parser = argparse.ArgumentParser(description='Predict COPD probability.')
+    # config 로드
+    with open("config.yaml", 'r') as f:
+        cfg = yaml.safe_load(f)
 
-    # Data arguments
-    parser.add_argument(
-        '-data',
-        type=str,
-        help='Input data string or path to a .xlsx file containing the data.',
-        required=False,
-        default=(params['data'] if params else './data/sample.xlsx')
-    )
-    parser.add_argument(
-        '-age',
-        type=int,
-        help='Age of the patient.',
-        required=False,
-        default=(params['age'] if params else 53)
-    )
-    parser.add_argument(
-        '-sex',
-        type=int,
-        help='Sex of the patient.',
-        required=False,
-        default=(params['sex'] if params else 0)
-    )
-    parser.add_argument(
-        '-smoke',
-        type=int,
-        help='Smoking status of the patient.',
-        required=False,
-        default=(params['smoke'] if params else 1)
+    # 모델 로드
+    encoder, explainer, catboost_detection, catboost_prediction = load_models(
+        checkpoint_dir=cfg['output']['checkpoint_dir'], cfg=cfg
     )
 
-    # Model paths
-    parser.add_argument(
-        '-spiro_encoder_path',
-        type=str,
-        help='Path to the trained SpiroEncoder model file.',
-        required=False,
-        default="./weights/SpiroEncoder.pth"
-    )
-    parser.add_argument(
-        '-spiro_explainer_path',
-        type=str,
-        help='Path to the trained SpiroExplainer model file.',
-        required=False,
-        default="./weights/SpiroExplainer.cbm"
-    )
-    parser.add_argument(
-        '-spiro_predictor_path',
-        type=str,
-        help='Path to the trained SpiroPredictor model file.',
-        required=False,
-        default="./weights/SpiroPredictor.cbm"
-    )
+    # 샘플 로드 (CSV: 반드시 아래 컬럼 포함)
+    # 예시: SEQN, age, sex, smoking, fev1fvc, flow_np_path, flow_time_np_path
+    df = pd.read_csv(args.input_csv)
+    results = []
 
-    # Thresholds and other settings
-    parser.add_argument(
-        '-spiroexplainer_threshold',
-        type=float,
-        help='Threshold for SpiroExplainer model.',
-        required=False,
-        default=0.1
-    )
-    parser.add_argument(
-        '-num_threads',
-        type=int,
-        help='Number of threads to use for prediction.',
-        required=False,
-        default=8
-    )
-    parser.add_argument(
-        '-device_str',
-        type=str,
-        help='Device to use for prediction.',
-        required=False,
-        default='cuda'
-    )
+    for idx, row in df.iterrows():
+        # flow_np_path, flow_time_np_path 를 통해 flow 배열과 flow_time 불러오기
+        flow_array = np.load(row['flow_np_path'])         # (N,) 1차원 flow 배열
+        flow_time  = np.load(row['flow_time_np_path'])    # (N,) flow_time 배열
+        patch_length = cfg['data']['patch_length']
+        seq_len = len(flow_array)
+        n_patches = int(np.ceil(seq_len / patch_length))
+        padded_len = n_patches * patch_length
+        pad_amount = padded_len - seq_len
+        flow_padded = np.concatenate([flow_array, np.zeros(pad_amount, dtype=np.float32)])
+        flow_patches = flow_padded.reshape(n_patches, patch_length)
 
-    return parser.parse_args()
+        # Tensor 형태로 변환: (1, n_patches, 1, patch_length)
+        flow_patches_tensor = torch.from_numpy(flow_patches).unsqueeze(0).unsqueeze(1).float()
 
+        age = row['age']
+        sex = row['sex']
+        smoking = row['smoking']
+        fev1fvc = row['fev1fvc']
+        clinical_feats = np.array([[age, sex, smoking, fev1fvc]], dtype=np.float32)  # (1,4)
 
-def main(params=None):
-    args = parse_arguments(params)
-
-    folders = ['weights']
-    for folder in folders:
-        if not os.path.exists(folder):
-            os.makedirs(folder)
-            print(f"Created folder: {folder}")
-
-    torch.set_num_threads(args.num_threads)
-
-    processed_data = preprocess_data(
-        input_path=args.data, age=args.age, sex=args.sex, smoke=args.smoke
-    )
-
-    print("Running the model. Please wait...")
-
-    device = torch.device(args.device_str if torch.cuda.is_available() and args.device_str == "cuda" else "cpu")
-    if device.type == "cuda":
-        device_name = torch.cuda.get_device_name(torch.cuda.current_device())
-        print(f"\n🚀Running model on GPU: {device_name}")
-    else:
-        print("\n⚙️ Running model on CPU")
-
-    # Run SpiroEncoder
-    spiro_encoder_original_result, attention_weights, all_input_x = run_spiro_encoder(
-        model=load_spiro_encoder(device_str=args.device_str, model_path=args.spiro_encoder_path),
-        data=processed_data,
-        device=device
-    )
-
-    # Run SpiroExplainer
-    spiro_explainer_result, image_base64 = run_spiro_explainer(
-        model=load_cb_model(model_path=args.spiro_explainer_path),
-        data=processed_data,
-        threshold=args.spiroexplainer_threshold,
-        spiro_encoder_original_result=spiro_encoder_original_result,
-        attention_weights=attention_weights,
-        all_input_x=all_input_x,
-        is_show=True
-    )
-
-    # Run SpiroPredictor if necessary
-    spiro_predictor_result = {}
-    if not spiro_explainer_result:
-        spiro_predictor = run_spiro_predictor(
-            model=load_cb_model(model_path=args.spiro_predictor_path),
-            data=processed_data
+        # 예측
+        prob_copd, prob_future = predict_copd(
+            sample_flow_patches=flow_patches_tensor,
+            sample_clinical_feats=clinical_feats,
+            encoder=encoder,
+            explainer=explainer,
+            catboost_detection=catboost_detection,
+            catboost_prediction=catboost_prediction,
+            cfg=cfg
         )
-        spiro_predictor_result = spiro_predictor[0][1:6]
 
-    if spiro_explainer_result:
-        print("\n=== COPD Detection Result ===")
-        print("✅ COPD Detected: Positive")
-    else:
-        print("\n=== COPD Detection Result ===")
-        print("❌ COPD Detected: Negative")
-        print("\n=== Future COPD Risk Prediction ===")
-        print(f"📅 1-Year Risk:   {spiro_predictor_result[0]:.2f}")
-        print(f"📅 2-Year Risk:   {spiro_predictor_result[1]:.2f}")
-        print(f"📅 3-Year Risk:   {spiro_predictor_result[2]:.2f}")
-        print(f"📅 4-Year Risk:   {spiro_predictor_result[3]:.2f}")
-        print(f"📅 5+ Year Risk:  {spiro_predictor_result[4]:.2f}")
+        results.append({
+            'SEQN': row['SEQN'],
+            'prob_copd': prob_copd,
+            'prob_future': prob_future
+        })
 
-    return spiro_explainer_result, spiro_predictor_result, image_base64
-
+    out_df = pd.DataFrame(results)
+    out_df.to_csv(args.output_csv, index=False)
+    print("예측 결과 저장 완료:", args.output_csv)
 
 if __name__ == "__main__":
     main()

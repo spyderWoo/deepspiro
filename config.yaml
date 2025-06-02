@@ -1,0 +1,24 @@
+data:
+  demo_path:      "data/DEMO_G.XPT"
+  smq_path:       "data/SMQ_G.XPT"
+  spx_g_path:     "data/SPX_G.xpt"
+  spxraw_g_path:  "data/spxraw_g.sas7bdat"
+
+  smoothing_sigma: 2
+  patch_length:    128
+  batch_size:      16
+
+model:
+  net1d_channels: [16, 32]
+  lstm_hidden_size: 32
+  attention_dim:   64
+
+train:
+  learning_rate:        1e-4
+  epochs_detection:    30
+  epochs_prediction:   20
+  device:              "cuda"
+
+output:
+  checkpoint_dir: "weights"
+  figures_dir:    "weights/figures"
