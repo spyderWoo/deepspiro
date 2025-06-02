@@ -90,3 +90,20 @@ Alternatively, you can omit the arguments to use default values.
 
 ## Data Sources
 The data used in this project is sourced from the UK Biobank, available upon application approval. For more information, visit the [UK Biobank website](https://www.ukbiobank.ac.uk).
+
+## 1. 필수 데이터 준비
+
+이 저장소에는 모델 학습에 필요한 대용량 원시 spirogram 데이터(`spxraw_g.sas7bdat`)를 포함하지 않습니다.  
+아래 NHANES 공식 링크에서 직접 다운로드하여 **`data/`** 폴더에 넣어주세요:
+
+- SPXRAW_G.sas7bdat (약 441 MB):  
+  https://www.cdc.gov/Nchs/Nhanes/2011-2012/SPXRAW_G.sas7bdat
+
+- SPX_G.xpt (약 몇 MB):  
+  https://www.cdc.gov/Nchs/Nhanes/2011-2012/SPX_G.XPT
+
+- DEMO_G.xpt (약 몇 MB):  
+  https://www.cdc.gov/Nchs/Nhanes/2011-2012/DEMO_G.XPT
+
+- SMQ_G.xpt (약 몇 MB):  
+  https://www.cdc.gov/Nchs/Nhanes/2011-2012/SMQ_G.XPT
