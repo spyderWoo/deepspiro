@@ -1,6 +1,7 @@
 numpy
 pandas
 PyYAML
+pyreadstat
 scikit-learn
 torch
 torchvision

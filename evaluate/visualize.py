@@ -3,7 +3,7 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, precision_recall_curve, roc_auc_score
+from sklearn.metrics import roc_curve, precision_recall_curve, roc_auc_score, average_precision_score
 
 def plot_roc(y_true, y_prob, save_path="roc.png"):
     """

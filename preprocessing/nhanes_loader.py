@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+import pyreadstat
 
 from .smoother import gaussian_smooth
 from .flow_converter import time_to_flow, construct_flow_volume
@@ -30,20 +31,23 @@ class NHANESDataset(Dataset):
         self.smoothing_sigma = smoothing_sigma
 
         # 1) DEMO 데이터
-        df_demo = pd.read_xport(demo_path)[['SEQN', 'RIDAGEYR', 'RIAGENDR']]
+        df_demo, _ = pyreadstat.read_xport(demo_path)
+        df_demo = df_demo[['SEQN', 'RIDAGEYR', 'RIAGENDR']]
         df_demo.rename(columns={'RIDAGEYR':'AGE', 'RIAGENDR':'GENDER'}, inplace=True)
         # GENDER: 1=Male, 2=Female → 0/1 인코딩
         df_demo['SEX'] = (df_demo['GENDER'] == 1).astype(int)
 
         # 2) SMQ 데이터
-        df_smq = pd.read_xport(smq_path)[['SEQN', 'SMQ020']]
+        df_smq, _ = pyreadstat.read_xport(smq_path)
+        df_smq = df_smq[['SEQN', 'SMQ020']]
         # SMQ020: 1=Yes, 2=No, NaN=No
         df_smq['SMOKING'] = df_smq['SMQ020'].apply(lambda x: 1 if x == 1.0 else 0).astype(int)
         df_smq = df_smq[['SEQN', 'SMOKING']]
 
         # 3) SPX_G 데이터 (Pre-BD 요약값)
         #    SPXNFEV1, SPXNFVC: 밀리리터 단위 → 리터 단위로 변환
-        df_spx_g = pd.read_xport(spx_g_path)[['SEQN', 'SPXNFEV1', 'SPXNFVC']]
+        df_spx_g, _ = pyreadstat.read_xport(spx_g_path)
+        df_spx_g = df_spx_g[['SEQN', 'SPXNFEV1', 'SPXNFVC']]
         df_spx_g.rename(columns={'SPXNFEV1':'FEV1_ml', 'SPXNFVC':'FVC_ml'}, inplace=True)
         df_spx_g['FEV1'] = df_spx_g['FEV1_ml'] / 1000.0
         df_spx_g['FVC'] = df_spx_g['FVC_ml'] / 1000.0
@@ -60,8 +64,8 @@ class NHANESDataset(Dataset):
         # 5) SPXRAW_G 데이터 (raw 시계열) 로드
         #    컬럼: ['SEQN', 'SPXRAW'] 에서 SPXRAW는 “콤마 구분된 문자열” 형태
         if os.path.exists(spxraw_g_path):
-            df_raw = pd.read_sas(spxraw_g_path, format='sas7bdat') \
-                       [['SEQN', 'SPXRAW']].dropna(subset=['SPXRAW'])
+            df_raw, _ = pyreadstat.read_sas7bdat(spxraw_g_path)
+            df_raw = df_raw[['SEQN', 'SPXRAW']].dropna(subset=['SPXRAW'])
             # SPXRAW: 문자열(byte → str) 형태이므로, bytes→str 로 변환
             # 예: b"0,1,2,3,..." → "0,1,2,3,..." 로 변환 후 np.fromstring
             def parse_raw_string(x):
@@ -142,9 +146,9 @@ class NHANESDataset(Dataset):
             flow_patches = torch.from_numpy(flow_patches).unsqueeze(1)  # (n_patches, 1, patch_len)
             mask = torch.ones(n_patches, dtype=torch.float32)
         else:
-            # raw curve 없음 → 일단 길이 0 patch, mask도 빈 Tensor
-            flow_patches = torch.zeros((0, 1, self.patch_length), dtype=torch.float32)
-            mask = torch.zeros((0,), dtype=torch.float32)
+            # raw curve 없음 → 최소 하나의 0 패치 반환
+            flow_patches = torch.zeros((1, 1, self.patch_length), dtype=torch.float32)
+            mask = torch.zeros((1,), dtype=torch.float32)
 
         return {
             'flow_patches': flow_patches,  # (n_patches,1,patch_length)
