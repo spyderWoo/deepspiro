@@ -1,8 +1,9 @@
-torch
 numpy
 pandas
-catboost
+PyYAML
+scikit-learn
+torch
+torchvision
 matplotlib
 scipy
-openpyxl
-requests
+shap

@@ -1,17 +1,15 @@
-################################################################################
-# smoother.py
-# 1차원 Gaussian filter를 사용해 volume 곡선을 부드럽게(smoothing) 처리
-################################################################################
+# preprocessing/smoother.py
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
-def smooth_volume(volume: np.ndarray, sigma: float = 2.0) -> np.ndarray:
+def gaussian_smooth(curve: np.ndarray, sigma: float = 2.0) -> np.ndarray:
     """
-    입력:
-      volume: 1D numpy array (단위: L)
-      sigma: Gaussian smoothing 표준편차
-    출력:
-      동일한 길이의 부드럽게 처리된 volume (numpy array)
+    1차원 Time–Volume 시계열(curve)에 Gaussian filter를 적용하여 부드럽게 만듭니다.
+    Args:
+      curve: numpy array, 원본 Time–Volume [V(t)] 시계열
+      sigma: Gaussian 표준편차
+    Returns:
+      smoothed_curve: numpy array, 부드럽게 처리된 시계열
     """
-    return gaussian_filter1d(volume, sigma=sigma, mode='nearest')
+    return gaussian_filter1d(curve, sigma=sigma)

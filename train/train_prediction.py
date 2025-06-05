@@ -1,118 +1,173 @@
+# train/train_prediction.py
+
 import os
-import yaml
+import time
 import numpy as np
 import torch
-from catboost import CatBoostClassifier
-from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
 
-from preprocessing.nhanes_loader import NHANESDataset
-from model.spiro_predictor import compute_concavity
+from evaluate.metrics import compute_metrics
+from evaluate.visualize import plot_roc, plot_pr
 
-def train_prediction(cfg, encoder, explainer, catboost_detection_model):
-    # ─────────────────────────────────────────────────────────────────────────
-    # 수정: demo_path, smq_path도 넘겨줘야 함
-    dataset = NHANESDataset(
-        demo_path      = cfg['data']['demo_path'],       # 추가된 인자
-        smq_path       = cfg['data']['smq_path'],        # 추가된 인자
-        spx_g_path     = cfg['data']['spx_g_path'],
-        spxraw_g_path  = cfg['data']['spxraw_g_path'],
-        patch_length   = cfg['data']['patch_length'],
-        smoothing_sigma= cfg['data']['smoothing_sigma']
+from model.spiro_predictor import SpiroPredictor, compute_concavity_features
+from model.spiro_encoder import SpiroEncoder  # 필요 시
+from model.spiro_explainer import SpiroExplainer  # 필요 시
+
+from tqdm import tqdm
+
+def collate_fn(batch):
+    """
+    Detection과 동일한 collate_fn을 그대로 사용합니다.
+    """
+    max_n_patches = max(item['flow_patches'].shape[0] for item in batch)
+    patch_len = batch[0]['flow_patches'].shape[-1]
+    B = len(batch)
+
+    flow_patches_padded = torch.zeros((B, max_n_patches, 1, patch_len), dtype=torch.float32)
+    mask_padded = torch.zeros((B, max_n_patches), dtype=torch.float32)
+    ages = []
+    sexes = []
+    smokings = []
+    labels = []
+
+    for i, item in enumerate(batch):
+        n_p = item['flow_patches'].shape[0]
+        flow_patches_padded[i, :n_p, :, :] = item['flow_patches']
+        mask_padded[i, :n_p] = item['mask']
+        ages.append(item['age'])
+        sexes.append(item['sex'])
+        smokings.append(item['smoking'])
+        labels.append(item['label'])
+
+    ages = torch.stack(ages, dim=0)
+    sexes = torch.stack(sexes, dim=0)
+    smokings = torch.stack(smokings, dim=0)
+    labels = torch.stack(labels, dim=0)
+
+    return {
+        'flow_patches': flow_patches_padded,  # (B, max_n_patches, 1, patch_len)
+        'mask': mask_padded,                  # (B, max_n_patches)
+        'age': ages,                          # (B,1)
+        'sex': sexes,                         # (B,1)
+        'smoking': smokings,                  # (B,1)
+        'label': labels                       # (B,1)
+    }
+
+def train_prediction(dataset, cfg, detection_models=None):
+    """
+    DeepSpiro 방식으로 Early Prediction 모델 학습.
+    - SpiroPredictor 사용(BCEWithLogitsLoss)
+    - patch별 concavity 특징 4개 사용
+    """
+    tp_cfg = cfg['train']
+    device = torch.device(tp_cfg['device'] if torch.cuda.is_available() else 'cpu')
+    batch_size = int(cfg['data']['batch_size'])
+    epochs     = int(cfg['train']['epochs_prediction'])
+    lr         = float(cfg['train']['learning_rate'])
+    test_size  = float(cfg['train']['test_size'])
+    seed       = int(cfg['train']['random_seed'])
+
+    total_len = len(dataset)
+    val_len   = int(total_len * test_size)
+    train_len = total_len - val_len
+    train_set, val_set = random_split(dataset, [train_len, val_len],
+                                      generator=torch.Generator().manual_seed(seed))
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_fn
     )
-    # ─────────────────────────────────────────────────────────────────────────
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
 
-    n_total = len(dataset)
-    indices = np.arange(n_total)
-    np.random.seed(0)
-    np.random.shuffle(indices)
-    split = int(0.8 * n_total)
-    train_idx, val_idx = indices[:split], indices[split:]
+    # 모델 초기화: 입력 차원 = DEMO(3) + concavity(4) = 7
+    predictor = SpiroPredictor(input_dim=3 + 4, hidden_dim=cfg['model']['explainer_hidden_dim']).to(device)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(predictor.parameters(), lr=lr)
 
-    device = torch.device(cfg['train']['device'])
-    encoder.eval()
-    explainer.eval()
-
-    X_train, y_train = [], []
-    for i in train_idx:
-        sample = dataset[i]
-        flow_patches = sample['flow_patches'].unsqueeze(0)  # (1, n_patches, 1, patch_length)
-        mask = sample['mask'].unsqueeze(0)
-        seq_len = sample['seq_len'].unsqueeze(0)
-        age = sample['age'].item()
-        sex = sample['sex'].item()
-        smoking = sample['smoking'].item()
-        fev1fvc = sample['fev1fvc'].item()
-        label = sample['label'].item()
-
-        with torch.no_grad():
-            lstm_out = encoder(flow_patches, mask, seq_len)
-            prob_neural, _ = explainer(lstm_out, None, seq_len)
-        neural_prob = prob_neural.cpu().numpy().item()
-
-        # concavity 계산을 위해 원시 flow, flow_time을 얻어야 함
-        # dataset 내부 메서드를 직접 호출 (예시) → 실제 구현 시 개선 필요
-        # >> 여기는 demo/smq로 사용한 정보와 관계 없음. 예시에서는 dummy zero vector 사용
-        concavity_vals = np.zeros(4, dtype=np.float32)
-
-        # 향후 발병 라벨 예시: 이미 COPD(label=1)면 1, 아니면 0
-        label_future = 1 if label == 1 else 0
-
-        feat = np.concatenate([
-            np.array([neural_prob, age, sex, smoking, fev1fvc], dtype=np.float32),
-            concavity_vals
-        ])
-        X_train.append(feat)
-        y_train.append(label_future)
-
-    X_train = np.vstack(X_train)         # (n_train, 9)
-    y_train = np.array(y_train, dtype=np.int32)
-
-    # 2) CatBoostClassifier 학습 (Prediction)
-    catboost_pred = CatBoostClassifier(iterations=300, learning_rate=0.05, depth=4, verbose=False)
-    print(">>> CatBoost Prediction 모델 학습 시작...")
-    catboost_pred.fit(X_train, y_train, verbose=False)
-    print(">>> CatBoost 학습 완료.")
-
+    best_auc = 0.0
     os.makedirs(cfg['output']['checkpoint_dir'], exist_ok=True)
-    pred_path = os.path.join(cfg['output']['checkpoint_dir'], "SpiroPredictor.cbm")
-    catboost_pred.save_model(pred_path)
-    print("CatBoost Prediction 모델 저장 위치:", pred_path)
 
-    # 3) 검증 세트 평가
-    X_val, y_val = [], []
-    for i in val_idx:
-        sample = dataset[i]
-        flow_patches = sample['flow_patches'].unsqueeze(0)
-        mask = sample['mask'].unsqueeze(0)
-        seq_len = sample['seq_len'].unsqueeze(0)
-        age = sample['age'].item()
-        sex = sample['sex'].item()
-        smoking = sample['smoking'].item()
-        fev1fvc = sample['fev1fvc'].item()
-        label = sample['label'].item()
+    print(f"▶️ Prediction 학습 시작 시각: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    total_start_time = time.time()
+    for epoch in range(1, epochs+1):
+        epoch_start_time = time.time()
 
+        predictor.train()
+        epoch_losses = []
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [Train]"):
+            flow_patches = batch['flow_patches'].to(device)  # (B, n_patches,1,patch_len)
+            age          = batch['age'].to(device)           # (B,1)
+            sex          = batch['sex'].to(device)           # (B,1)
+            smoking      = batch['smoking'].to(device)       # (B,1)
+            label        = batch['label'].to(device).squeeze(1)  # (B,)
+
+            # concavity 특징 계산 → (B,4)
+            concav = compute_concavity_features(flow_patches, cfg['model']['patch_length']).to(device)
+
+            optimizer.zero_grad()
+            y_logit = predictor(age, sex, smoking, concav)  # (B,)
+            loss = criterion(y_logit, label)
+            loss.backward()
+            optimizer.step()
+            epoch_losses.append(loss.item())
+
+        # 검증 루프
+        predictor.eval()
+        y_true_list = []
+        y_prob_list = []
         with torch.no_grad():
-            lstm_out = encoder(flow_patches, mask, seq_len)
-            prob_neural, _ = explainer(lstm_out, None, seq_len)
-        neural_prob = prob_neural.cpu().numpy().item()
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch}/{epochs} [Valid]"):
+                flow_patches = batch['flow_patches'].to(device)
+                age          = batch['age'].to(device)
+                sex          = batch['sex'].to(device)
+                smoking      = batch['smoking'].to(device)
+                label        = batch['label'].to(device).squeeze(1)
 
-        concavity_vals = np.zeros(4, dtype=np.float32)
-        label_future = 1 if label == 1 else 0
+                concav = compute_concavity_features(flow_patches, cfg['model']['patch_length']).to(device)
+                y_logit = predictor(age, sex, smoking, concav)
+                y_prob = torch.sigmoid(y_logit)
 
-        feat = np.concatenate([
-            np.array([neural_prob, age, sex, smoking, fev1fvc], dtype=np.float32),
-            concavity_vals
-        ])
-        X_val.append(feat)
-        y_val.append(label_future)
+                y_true_list.append(label.cpu().numpy())
+                y_prob_list.append(y_prob.cpu().numpy())
 
-    X_val = np.vstack(X_val)
-    y_val = np.array(y_val, dtype=np.int32)
-    val_preds = catboost_pred.predict_proba(X_val)[:, 1]
-    auroc = roc_auc_score(y_val, val_preds)
-    auprc = average_precision_score(y_val, val_preds)
-    f1 = f1_score(y_val, (val_preds > 0.5).astype(int))
+        y_true_all = np.concatenate(y_true_list)
+        y_prob_all = np.concatenate(y_prob_list)
+        y_pred_all = (y_prob_all >= 0.5).astype(int)
 
-    print(f"[Prediction 검증] AUROC: {auroc:.4f}, AUPRC: {auprc:.4f}, F1-score: {f1:.4f}")
+        metrics = compute_metrics(y_true_all, y_pred_all, y_prob_all)
+        avg_loss = np.mean(epoch_losses)
+        epoch_duration = time.time() - epoch_start_time
 
-    return catboost_pred
+        print(f"[Epoch {epoch}/{epochs}] "
+              f"loss: {avg_loss:.4f} | AUROC: {metrics['auroc']:.4f} | "
+              f"AUPRC: {metrics['auprc']:.4f} | F1: {metrics['f1']:.4f} | "
+              f"Epoch Time: {epoch_duration:.1f}s")
+
+        if metrics['auroc'] > best_auc:
+            best_auc = metrics['auroc']
+            ckpt_path = os.path.join(cfg['output']['checkpoint_dir'], "deepspiro_prediction_best.pth")
+            torch.save(predictor.state_dict(), ckpt_path)
+
+    total_duration = time.time() - total_start_time
+    print(f"▶️ 전체 Prediction 학습 완료 시각: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"▶️ 전체 Prediction 학습 시간: {total_duration:.1f}s ({total_duration/60:.2f}분)")
+
+    # ROC/PR 곡선 저장
+    plot_roc(y_true_all, y_prob_all, save_path=os.path.join(cfg['output']['figures_dir'], "roc_prediction.png"))
+    plot_pr(y_true_all, y_prob_all, save_path=os.path.join(cfg['output']['figures_dir'], "pr_prediction.png"))
+    print("▶️ Prediction 모델 및 ROC/PR 곡선 저장 완료")
+
+    return predictor

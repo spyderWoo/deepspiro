@@ -1,202 +1,156 @@
-################################################################################
-# nhanes_loader.py
-# NHANES 2011-2012 DEMO_G.xpt, SMQ_G.xpt, SPX_G.xpt, SPXRAW_G.sas7bdat을
-# 읽어와 PyTorch Dataset으로 가공합니다.
-#
-# 1. DEMO_G.xpt  → 연령(RIDAGEYR), 성별(RIAGENDR)
-# 2. SMQ_G.xpt   → 흡연 상태(SMQ040)
-# 3. SPX_G.xpt   → Pre‐BD FEV1 (SPXNFEV1), Pre‐BD FVC (SPXNQFVC) → FEV1/FVC 비율 계산
-# 4. SPXRAW_G.sas7bdat → 각 참가자의 Time–Volume 시계열(원시 곡선)
-# 5. Gaussian smoothing → Time→Flow 변환 → patch 단위 분할/패딩
-################################################################################
+# preprocessing/nhanes_loader.py
 
-import pandas as pd
-import pyreadstat
+import os
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from .smoother import gaussian_smooth
+from .flow_converter import time_to_flow, construct_flow_volume
+
 class NHANESDataset(Dataset):
     """
-    NHANES SPX 데이터를 기반으로 PyTorch Dataset을 구현합니다.
-    각 아이템은 아래 키들을 포함하는 dict 형태로 반환됩니다.
-      - flow_patches: (n_patches, 1, patch_length) Tensor
-      - mask:         (n_patches,) Tensor
-      - seq_len:      스칼라 Tensor (= n_patches)
-      - age:          (1,) Tensor
-      - sex:          (1,) Tensor (0=여성, 1=남성)
-      - smoking:      (1,) Tensor (0=비흡연, 1=흡연)
-      - fev1fvc:      (1,) Tensor (FEV1/FVC 비율)
-      - label:        (1,) Tensor (0=non-COPD, 1=COPD)
+    NHANES SPX_G & SPXRAW_G 기반으로 DeepSpiro용 데이터셋을 구성합니다.
+    - DEMO (DEMO_G.xpt): SEQN, RIDAGEYR(나이), RIAGENDR(성별)
+    - SMQ  (SMQ_G.xpt): SEQN, SMQ020(흡연 여부)
+    - SPX_G (SPX_G.xpt): SEQN, SPXNFEV1, SPXNFVC (Pre-BD)
+    - SPXRAW_G (SPXRAW_G.sas7bdat): SEQN별 raw curve('SPXRAW') ->  시간–부피 시계열
     """
 
     def __init__(self,
-                 demo_path:   str,
-                 smq_path:    str,
-                 spx_g_path:  str,
+                 demo_path: str,
+                 smq_path: str,
+                 spx_g_path: str,
                  spxraw_g_path: str,
-                 patch_length:  int,
-                 smoothing_sigma: float):
+                 smoothing_sigma: float = 2.0,
+                 patch_length: int = 128):
         super().__init__()
-
-        # ─────────────────────────────────────────────────────────────────────────
-        # 1) DEMO_G.xpt 읽기 → 연령 및 성별 가져오기
-        demo_df, _ = pyreadstat.read_xport(demo_path)
-        demo_df = demo_df[['SEQN', 'RIDAGEYR', 'RIAGENDR']].copy()
-        # RIAGENDR: 1=남, 2=여 → 1=남성, 0=여성으로 매핑
-        demo_df['SEX_BINARY'] = demo_df['RIAGENDR'].map({1: 1, 2: 0})
-
-        # 2) SMQ_G.xpt 읽기 → 흡연 상태 (SMQ040: 과거 5일간 흡연 여부)
-        smq_df, _ = pyreadstat.read_xport(smq_path)
-        smq_df = smq_df[['SEQN', 'SMQ040']].copy()
-        # SMQ040: 1=예, 2=아니오, 7=모름/거절 → 1→1, 2→0, 기타 NaN 처리
-        smq_df['SMOKING_BINARY'] = smq_df['SMQ040'].map({1: 1, 2: 0})
-        smq_df['SMOKING_BINARY'] = smq_df['SMOKING_BINARY'].fillna(0).astype(int)
-
-        # 3) SPX_G.xpt 읽기 → Pre‐BD FEV1 (SPXNFEV1), Pre‐BD FVC (SPXNQFVC)
-        spx_g_df, _ = pyreadstat.read_xport(spx_g_path, encoding='utf-8')
-        spx_g_df = spx_g_df[['SEQN', 'SPXNFEV1', 'SPXNQFVC']].copy()
-
-        # → 문자열이 섞여 있을 수 있으므로, numeric으로 강제 변환
-        spx_g_df['SPXNFEV1']  = pd.to_numeric(spx_g_df['SPXNFEV1'],  errors='coerce')
-        spx_g_df['SPXNQFVC'] = pd.to_numeric(spx_g_df['SPXNQFVC'], errors='coerce')
-
-        # NaN이 있는 행(변환 실패한 문자열) 제거
-        spx_g_df = spx_g_df.dropna(subset=['SPXNFEV1', 'SPXNQFVC'])
-
-        # FEV1/FVC 비율 계산 (이제 둘 다 float 타입)
-        spx_g_df['FEV1_FVC'] = (
-            spx_g_df['SPXNFEV1'] / spx_g_df['SPXNQFVC']
-        )
-
-        # 4) DEMO + SMQ + SPX 요약값 merge (inner join)
-        merged_df = demo_df.merge(
-            smq_df[['SEQN','SMOKING_BINARY']], on='SEQN', how='inner'
-        )
-        merged_df = merged_df.merge(
-            spx_g_df[['SEQN','FEV1_FVC']], on='SEQN', how='inner'
-        )
-
-        # 5) COPD label: FEV1/FVC < 0.70 → label = 1, else 0
-        merged_df['LABEL_COPD'] = (merged_df['FEV1_FVC'] < 0.7).astype(int)
-
-        # DataFrame 저장
-        self.summary_df = merged_df.reset_index(drop=True)
-        print(f">>> NHANES DEMO+SMQ+SPX 요약 샘플 수: {len(self.summary_df)}")
-
-        # ─────────────────────────────────────────────────────────────────────────
-        # 원시 spirogram 곡선 파일 경로 & 파라미터
-        self.raw_path        = spxraw_g_path
-        self.patch_length    = patch_length
+        self.patch_length = patch_length
         self.smoothing_sigma = smoothing_sigma
 
-        # SEQN 리스트 (순서 유지)
-        self.seqn_list = self.summary_df['SEQN'].values
+        # 1) DEMO 데이터
+        df_demo = pd.read_xport(demo_path)[['SEQN', 'RIDAGEYR', 'RIAGENDR']]
+        df_demo.rename(columns={'RIDAGEYR':'AGE', 'RIAGENDR':'GENDER'}, inplace=True)
+        # GENDER: 1=Male, 2=Female → 0/1 인코딩
+        df_demo['SEX'] = (df_demo['GENDER'] == 1).astype(int)
+
+        # 2) SMQ 데이터
+        df_smq = pd.read_xport(smq_path)[['SEQN', 'SMQ020']]
+        # SMQ020: 1=Yes, 2=No, NaN=No
+        df_smq['SMOKING'] = df_smq['SMQ020'].apply(lambda x: 1 if x == 1.0 else 0).astype(int)
+        df_smq = df_smq[['SEQN', 'SMOKING']]
+
+        # 3) SPX_G 데이터 (Pre-BD 요약값)
+        #    SPXNFEV1, SPXNFVC: 밀리리터 단위 → 리터 단위로 변환
+        df_spx_g = pd.read_xport(spx_g_path)[['SEQN', 'SPXNFEV1', 'SPXNFVC']]
+        df_spx_g.rename(columns={'SPXNFEV1':'FEV1_ml', 'SPXNFVC':'FVC_ml'}, inplace=True)
+        df_spx_g['FEV1'] = df_spx_g['FEV1_ml'] / 1000.0
+        df_spx_g['FVC'] = df_spx_g['FVC_ml'] / 1000.0
+        df_spx_g['FEV1_FVC'] = df_spx_g['FEV1'] / df_spx_g['FVC']
+        df_spx_g = df_spx_g[['SEQN', 'FEV1_FVC']]
+
+        # 4) 세 테이블(DEMO, SMQ, SPX_G) 병합 → 레이블 생성
+        #    - Self-report 정보 대신 일단 FEV1/FVC < 0.70 → COPD 확진(1), else (0)
+        df_demo_smq = pd.merge(df_demo, df_smq, on='SEQN', how='inner')
+        df_summary = pd.merge(df_demo_smq, df_spx_g, on='SEQN', how='inner')
+        # 레이블: FEV1_FVC < 0.70 → COPD(1), else 0
+        df_summary['LABEL'] = (df_summary['FEV1_FVC'] < 0.70).astype(int)
+
+        # 5) SPXRAW_G 데이터 (raw 시계열) 로드
+        #    컬럼: ['SEQN', 'SPXRAW'] 에서 SPXRAW는 “콤마 구분된 문자열” 형태
+        if os.path.exists(spxraw_g_path):
+            df_raw = pd.read_sas(spxraw_g_path, format='sas7bdat') \
+                       [['SEQN', 'SPXRAW']].dropna(subset=['SPXRAW'])
+            # SPXRAW: 문자열(byte → str) 형태이므로, bytes→str 로 변환
+            # 예: b"0,1,2,3,..." → "0,1,2,3,..." 로 변환 후 np.fromstring
+            def parse_raw_string(x):
+                if isinstance(x, bytes):
+                    s = x.decode('utf-8')
+                else:
+                    s = str(x)
+                # 공백 제거 후 콤마(,) 구분
+                return np.fromstring(s.replace(" ", ""), sep=',', dtype=np.float32)
+
+            df_raw['CURVE'] = df_raw['SPXRAW'].apply(parse_raw_string)
+        else:
+            df_raw = pd.DataFrame(columns=['SEQN', 'SPXRAW', 'CURVE'])
+
+        # 6) df_summary와 df_raw를 SEQN 기준으로 병합 (outer join → raw 없으면 NaN)
+        df_full = pd.merge(df_summary, df_raw[['SEQN', 'CURVE']], on='SEQN', how='left')
+        # CURVE NaN은 빈 배열로 대체
+        df_full['CURVE'] = df_full['CURVE'].apply(lambda x: x if isinstance(x, np.ndarray) else np.array([], dtype=np.float32))
+
+        # 7) 인덱스 재설정
+        df_full = df_full.reset_index(drop=True)
+
+        # 8) 클래스 변수 저장
+        self.summary_df = df_full
 
     def __len__(self):
         return len(self.summary_df)
 
     def __getitem__(self, idx):
-        # 1) summary_df에서 인구통계/임상정보 가져오기
+        """
+        한 샘플을 반환합니다. dict 형태로 return:
+        {
+         'flow_patches': Tensor(n_patches, 1, patch_length),
+         'mask':         Tensor(n_patches),
+         'age':          Tensor(1),
+         'sex':          Tensor(1),
+         'smoking':      Tensor(1),
+         'label':        Tensor(1)
+        }
+        """
         row = self.summary_df.iloc[idx]
-        seqn    = int(row['SEQN'])
-        age     = float(row['RIDAGEYR'])
-        sex     = int(row['SEX_BINARY'])       # 0=여성, 1=남성
-        smoking = int(row['SMOKING_BINARY'])
-        fev1fvc = float(row['FEV1_FVC'])
-        label   = int(row['LABEL_COPD'])
+        seqn = row['SEQN']
+        age = torch.tensor([row['AGE']], dtype=torch.float32)
+        sex = torch.tensor([row['SEX']], dtype=torch.float32)
+        smoking = torch.tensor([row['SMOKING']], dtype=torch.float32)
+        label = torch.tensor([row['LABEL']], dtype=torch.float32)
 
-        # 2) SPXRAW_G.sas7bdat에서 해당 SEQN의 Time–Volume 곡선 읽기
-        curve_df    = self._load_curve_for_seqn(seqn)
-        time        = curve_df['TIME'].values.astype(np.float32)         # 단위: ms
-        volume_ml   = curve_df['VOLUME'].values.astype(np.float32)      # 단위: mL
-        volume      = volume_ml / 1000.0                                  # mL → L
+        # 1) raw curve가 있으면 부드럽게(smoothing), 시간→유량, volume→flow curve 생성
+        curve = row['CURVE']  # numpy 1d array, 시간-부피 시계열
+        if curve.size > 0:
+            # Gaussian smoothing
+            curve_smooth = gaussian_smooth(curve, sigma=self.smoothing_sigma)
 
-        if len(volume) == 0:
-            # 비어 있는 경우 → 패딩 최소 크기
-            flow      = np.zeros(1, dtype=np.float32)
-            flow_time = np.array([0.0], dtype=np.float32)
+            # 시간 간격이 일정하다고 가정 (예: 10ms 간격 → 0.01 s)
+            # 실제 NHANES는 10ms 단위 → 0.01초
+            delta_t = 0.01  # 10ms
+
+            # Time→Flow (유량) 계산
+            flow = time_to_flow(curve_smooth, dt=delta_t)   # 길이 L-1 (C[1:]-C[:-1])/Δt
+
+            # Volume–Flow 곡선 생성: volume은 curve_smooth[:L-1], flow는 flow
+            v = curve_smooth[:-1]
+            f = flow
+            flow_volume = construct_flow_volume(v, f)  # (L-1, 2) 형태
+
+            # 2) flow_volume을 patch_length 단위로 잘라서 n_patches, 1, patch_length
+            n = flow_volume.shape[0]
+            patch_len = self.patch_length
+            n_patches = int(np.ceil(n / patch_len))
+            padded = np.zeros((n_patches * patch_len, 2), dtype=np.float32)
+            padded[:n, :] = flow_volume
+
+            patches = padded.reshape(n_patches, patch_len, 2)  # (n_patches, patch_len, 2)
+            # Flow–Volume은 2차원 데이터이지만, 논문 DeepSpiro는 “유량 축”만 학습하므로 1채널로 사용
+            # 채널 축 넣어서 (n_patches, 1, patch_len)
+            # 여기서는 “flow” 값만(두 번째 열) 사용
+            flow_patches = patches[:, :, 1]   # (n_patches, patch_len)
+            flow_patches = torch.from_numpy(flow_patches).unsqueeze(1)  # (n_patches, 1, patch_len)
+            mask = torch.ones(n_patches, dtype=torch.float32)
         else:
-            # 3) Gaussian smoothing 적용
-            from preprocessing.smoother import smooth_volume
-            volume_smoothed = smooth_volume(volume, sigma=self.smoothing_sigma)
-
-            # 4) Time → Flow 변환
-            from preprocessing.flow_converter import volume_to_flow
-            flow, flow_time = volume_to_flow(time, volume_smoothed)
-
-        # 5) patch 단위로 자르기 (부족한 부분 0 패딩)
-        seq_len   = len(flow)
-        n_patches = int(np.ceil(seq_len / self.patch_length))
-        padded_len= n_patches * self.patch_length
-        pad_amount= padded_len - seq_len
-
-        flow_padded  = np.concatenate([flow, np.zeros(pad_amount, dtype=np.float32)])
-        flow_patches = flow_padded.reshape(n_patches, self.patch_length)
-
-        # 6) mask 생성 (1=유효, 0=패딩) → 여기서는 모두 1로 둠
-        mask = np.ones(n_patches, dtype=np.float32)
-
-        # 7) PyTorch Tensor 변환
-        flow_patches_tensor = torch.from_numpy(flow_patches).unsqueeze(1)  # (n_patches, 1, patch_length)
-        mask_tensor         = torch.from_numpy(mask)                       # (n_patches,)
-        seq_len_tensor      = torch.tensor(n_patches, dtype=torch.long)    # 스칼라
-
-        age_tensor    = torch.tensor(age, dtype=torch.float32).unsqueeze(0)     # (1,)
-        sex_tensor    = torch.tensor(sex, dtype=torch.int64).unsqueeze(0)       # (1,)
-        smoking_tensor= torch.tensor(smoking, dtype=torch.int64).unsqueeze(0)   # (1,)
-        fev1fvc_tensor= torch.tensor(fev1fvc, dtype=torch.float32).unsqueeze(0) # (1,)
-        label_tensor  = torch.tensor(label, dtype=torch.float32).unsqueeze(0)   # (1,)
+            # raw curve 없음 → 일단 길이 0 patch, mask도 빈 Tensor
+            flow_patches = torch.zeros((0, 1, self.patch_length), dtype=torch.float32)
+            mask = torch.zeros((0,), dtype=torch.float32)
 
         return {
-            'flow_patches': flow_patches_tensor,
-            'mask':         mask_tensor,
-            'seq_len':      seq_len_tensor,
-            'age':          age_tensor,
-            'sex':          sex_tensor,
-            'smoking':      smoking_tensor,
-            'fev1fvc':      fev1fvc_tensor,
-            'label':        label_tensor
+            'flow_patches': flow_patches,  # (n_patches,1,patch_length)
+            'mask': mask,                  # (n_patches,)
+            'age': age,                    # (1,)
+            'sex': sex,                    # (1,)
+            'smoking': smoking,            # (1,)
+            'label': label                 # (1,)
         }
-
-    def _load_curve_for_seqn(self, seqn):
-        """
-        SPXRAW_G.sas7bdat에서 해당 SEQN만 필터하여 DataFrame(TIME, VOLUME)으로 반환
-        chunk 단위로 읽어 메모리 절약
-        """
-        reader = pyreadstat.read_file_in_chunks(
-            pyreadstat.read_sas7bdat, self.raw_path, chunksize=50000
-        )
-        for chunk_df, _ in reader:
-            filtered = chunk_df[chunk_df['SEQN'] == seqn]
-            if not filtered.empty:
-                return filtered[['TIME', 'VOLUME']].sort_values(
-                    by='TIME'
-                ).reset_index(drop=True)
-
-        # 해당 SEQN이 없으면 빈 DataFrame 반환
-        return pd.DataFrame({'TIME': [], 'VOLUME': []})
-
-
-if __name__ == "__main__":
-    # 단독 실행 시 요약 정보 및 예시 샘플 출력
-    import yaml
-    with open("config.yaml", 'r', encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    ds = NHANESDataset(
-        demo_path      = cfg['data']['demo_path'],
-        smq_path       = cfg['data']['smq_path'],
-        spx_g_path     = cfg['data']['spx_g_path'],
-        spxraw_g_path  = cfg['data']['spxraw_g_path'],
-        patch_length   = cfg['data']['patch_length'],
-        smoothing_sigma= cfg['data']['smoothing_sigma']
-    )
-    print("총 샘플 수:", len(ds))
-    sample = ds[0]
-    print("샘플 키:", sample.keys())
-    print("flow_patches shape:", sample['flow_patches'].shape)
-    print("mask shape:", sample['mask'].shape)
-    print("seq_len:", sample['seq_len'])
-    print("age, sex, smoking, fev1fvc, label:",
-          sample['age'], sample['sex'], sample['smoking'], sample['fev1fvc'], sample['label'])

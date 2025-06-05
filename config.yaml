@@ -1,23 +1,30 @@
-data:
-  demo_path:      "data/DEMO_G.XPT"
-  smq_path:       "data/SMQ_G.XPT"
-  spx_g_path:     "data/SPX_G.xpt"
-  spxraw_g_path:  "data/spxraw_g.sas7bdat"
+################################################################################
+# 프로젝트 설정 (모든 경로는 프로젝트 root 폴더 기준, UTF-8 인코딩)
+################################################################################
 
-  smoothing_sigma: 2
-  patch_length:    128
+data:
+  demo_path:      "data/DEMO_G.xpt"
+  smq_path:       "data/SMQ_G.xpt"
+  spx_g_path:     "data/SPX_G.xpt"
+  spxraw_g_path:  "data/SPXRAW_G.sas7bdat"
+
+  smoothing_sigma: 2     # SpiroSmoother에서 사용할 Gaussian 필터 σ
+  patch_length:    128   # 키패치(patch) 길이 (시간–부피 시계열 분할 시)
   batch_size:      16
 
 model:
-  net1d_channels: [16, 32]
-  lstm_hidden_size: 32
-  attention_dim:   64
+  net1d_channels:      [16, 32]    # Net1D 채널 크기 (1D-CNN 크기)
+  lstm_hidden_size:    32          # Bi-LSTM 숨김 크기 (encoder_dim)
+  explainer_hidden_dim: 64         # SpiroExplainer 내부 FC 레이어 숨김 크기
+  patch_length:        128         # SpiroPredictor에서 concavity 계산 시 patch 길이
 
 train:
-  learning_rate:        1e-4
-  epochs_detection:    30
-  epochs_prediction:   20
-  device:              "cuda"
+  device:       "cuda"      # 'cuda' 또는 'cpu'
+  learning_rate: 1e-4
+  epochs_detection: 30
+  epochs_prediction: 20
+  test_size:    0.20        # train/val split 비율
+  random_seed:  42
 
 output:
   checkpoint_dir: "weights"

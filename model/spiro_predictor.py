@@ -1,58 +1,85 @@
-################################################################################
-# spiro_predictor.py
-# Volume–Flow 곡선을 4개 구간으로 나누고 Baseline-directed area 방식으로 concavity 계산
-################################################################################
+# model/spiro_predictor.py
 
-import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-def compute_concavity(flow: np.ndarray, flow_time: np.ndarray, fev1fvc: float) -> np.ndarray:
+def compute_concavity_features(flow_patches, patch_length):
     """
-    flow: 1D numpy array (volume–flow 값)
-    flow_time: 1D numpy array (flow 샘플의 시간, ms)
-    fev1fvc: 피험자별 FEV1/FVC 비율 (scalar)
-    출력: concavity_vals (길이 4) 각 구간별 concavity 값
+    각 patch마다 concavity 지표 계산 → 4개 구간(PEF–FEF25, FEF25–FEF50, FEF50–FEF75, FEF75+)별 directed area 계산
+    Args:
+      flow_patches: Tensor (B, n_patches, 1, patch_length)
+      patch_length: int, patch 길이
+    Returns:
+      concav_features: Tensor (B, 4)
     """
-    # 1) PEF: 최대 flow 위치
-    idx_pef = np.argmax(flow)
+    B, n_patches, _, L = flow_patches.size()
+    # Flow–Volume 곡선에서 patch들은 시퀀스상 concat되어 있음 → 전체 길이 = n_patches * patch_length
+    # 간단하게 “각 patch” 별 최대 concavity 정도를 4개 patch 단위로 요약하겠음
+    # 예시: n_patches >= 4 라면 첫 4개 patch 각각의 concavity 지표 계산
+    #     n_patches < 4인 경우엔 부족한 patch를 0으로 채움
 
-    # 2) FEF25, FEF50, FEF75 값 추정 (퍼센타일 기반 예시)
-    fef25_val = np.percentile(flow, 75)
-    fef50_val = np.percentile(flow, 50)
-    fef75_val = np.percentile(flow, 25)
+    # 1) patch 하나당 concavity 지표: directed area
+    #    concavity = Σ (baseline(v) - flow(v))  (볼륨–유량 곡선이 baseline 아래에 있을수록 양수)
+    concav_per_patch = []
+    for i in range(n_patches):
+        # patch i의 flow 시계열: (1, patch_length)
+        patch_flow = flow_patches[:, i, 0, :]  # (B, patch_length)
+        # 볼륨은 “시간 시퀀스 인덱스”로 가정 → 0~(patch_length-1)
+        v = torch.arange(L, dtype=torch.float32, device=patch_flow.device).unsqueeze(0).repeat(B, 1)  # (B, L)
+        f = patch_flow  # (B, L)
 
-    idx_fef25 = np.argmin(np.abs(flow - fef25_val))
-    idx_fef50 = np.argmin(np.abs(flow - fef50_val))
-    idx_fef75 = np.argmin(np.abs(flow - fef75_val))
+        # baseline: 시작점(0, f(0)), 끝점(L-1, f(L-1))
+        m = (f[:, -1] - f[:, 0]) / (L - 1)  # (B,)
+        b = f[:, 0]  # (B,)
 
-    # 중복 제거 및 정렬
-    idxs = np.unique([idx_pef, idx_fef25, idx_fef50, idx_fef75, len(flow)-1])
-    idxs = np.sort(idxs)
-    if len(idxs) < 5:
-        # fallback: 0, 25%, 50%, 75%, end
-        idxs = np.array([0, int(len(flow)*0.25), int(len(flow)*0.50), int(len(flow)*0.75), len(flow)-1])
+        # directed area: Σ [ (m * v + b) - f ] over v=0..L-1
+        baseline = m.unsqueeze(1) * v + b.unsqueeze(1)  # (B, L)
+        diff = baseline - f                             # (B, L)
+        concav_val = torch.sum(diff, dim=1)             # (B,)  # patch별 concavity
+        concav_per_patch.append(concav_val.unsqueeze(1))  # list of (B,1)
 
-    concavity_vals = []
-    for i in range(4):
-        start, end = int(idxs[i]), int(idxs[i+1])
-        if end <= start:
-            concavity_vals.append(0.0)
-            continue
+    if n_patches == 0:
+        # 모든 concavity가 0
+        concav_tensor = torch.zeros((B, 4), device=flow_patches.device)
+        return concav_tensor
 
-        t0, f0 = flow_time[start], flow[start]
-        t1, f1 = flow_time[end], flow[end]
-        m = (f1 - f0) / (t1 - t0 + 1e-6)
-        t_seg = flow_time[start:end+1]
-        f_seg = flow[start:end+1]
-        bl = m * (t_seg - t0) + f0
-        diff = bl - f_seg
-        concavity_vals.append(np.sum(diff).astype(np.float32))
+    concav_all = torch.cat(concav_per_patch, dim=1)  # (B, n_patches)
 
-    return np.array(concavity_vals, dtype=np.float32)
+    # 2) 최종 4차원 벡터: 첫 4개 patch의 concavity (존재하지 않으면 0 padding)
+    if n_patches >= 4:
+        feat = concav_all[:, :4]  # (B,4)
+    else:
+        # 부족한 개수를 0으로 패딩
+        padded = torch.zeros((B, 4), device=flow_patches.device)
+        padded[:, :n_patches] = concav_all
+        feat = padded  # (B,4)
 
-if __name__ == "__main__":
-    # 예시
-    flow = np.array([0.0, 0.5, 1.2, 1.0, 0.8, 0.3, 0.0], dtype=np.float32)
-    flow_time = np.arange(len(flow), dtype=np.float32)
-    fev1fvc = 0.65
-    conc = compute_concavity(flow, flow_time, fev1fvc)
-    print("Concavity (4개 구간):", conc)
+    return feat
+
+
+class SpiroPredictor(nn.Module):
+    """
+    SpiroPredictor:
+      - 입력: age(1), sex(1), smoking(1), concavity(4) 총 7차원 → FC → BCEWithLogitsLoss
+    """
+
+    def __init__(self, input_dim=7, hidden_dim=64):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, age, sex, smoking, concav):
+        """
+        Args:
+          age, sex, smoking:   Tensors (B,1)
+          concav:              Tensor  (B,4)
+        Returns:
+          y_logit: Tensor (B,)
+        """
+        x = torch.cat([age, sex, smoking, concav], dim=1)  # (B,7)
+        x = F.relu(self.fc1(x))        # (B, hidden_dim)
+        x = F.relu(self.fc2(x))        # (B, hidden_dim)
+        y_logit = self.fc3(x)          # (B,1)
+        return y_logit.squeeze(1)      # (B,)

@@ -1,159 +1,202 @@
+# train/train_detection.py
+
 import os
-import yaml
+import time
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
-from catboost import CatBoostClassifier
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
 
-# 여기를 수정: NHANESDataset 임포트 경로 그대로 유지하되, 시그니처 변경 유의
-from preprocessing.nhanes_loader import NHANESDataset
+from evaluate.metrics import compute_metrics
+from evaluate.visualize import plot_roc, plot_pr
+
 from model.spiro_encoder import SpiroEncoder
 from model.spiro_explainer import SpiroExplainer
 
-def train_detection(cfg):
-    device = torch.device(cfg['train']['device'])
+from tqdm import tqdm
 
-    # ────────────────────────────────────────────────────────────────────────
-    # 수정: demo_path, smq_path도 넘겨줘야 함
-    dataset = NHANESDataset(
-        demo_path      = cfg['data']['demo_path'],       # 추가된 인수
-        smq_path       = cfg['data']['smq_path'],        # 추가된 인수
-        spx_g_path     = cfg['data']['spx_g_path'],
-        spxraw_g_path  = cfg['data']['spxraw_g_path'],
-        patch_length   = cfg['data']['patch_length'],
-        smoothing_sigma= cfg['data']['smoothing_sigma']
+def collate_fn(batch):
+    """
+    Custom collate_fn: 
+      - 배치 내 patch 개수가 다를 때, max_n_patches로 패딩.
+    """
+    max_n_patches = max(item['flow_patches'].shape[0] for item in batch)
+    patch_len = batch[0]['flow_patches'].shape[-1]
+    B = len(batch)
+
+    flow_patches_padded = torch.zeros((B, max_n_patches, 1, patch_len), dtype=torch.float32)
+    mask_padded = torch.zeros((B, max_n_patches), dtype=torch.float32)
+    ages = []
+    sexes = []
+    smokings = []
+    labels = []
+
+    for i, item in enumerate(batch):
+        n_p = item['flow_patches'].shape[0]
+        flow_patches_padded[i, :n_p, :, :] = item['flow_patches']
+        mask_padded[i, :n_p] = item['mask']
+        ages.append(item['age'])
+        sexes.append(item['sex'])
+        smokings.append(item['smoking'])
+        labels.append(item['label'])
+
+    ages = torch.stack(ages, dim=0)
+    sexes = torch.stack(sexes, dim=0)
+    smokings = torch.stack(smokings, dim=0)
+    labels = torch.stack(labels, dim=0)
+
+    return {
+        'flow_patches': flow_patches_padded,  # (B, max_n_patches, 1, patch_len)
+        'mask': mask_padded,                  # (B, max_n_patches)
+        'age': ages,                          # (B,1)
+        'sex': sexes,                         # (B,1)
+        'smoking': smokings,                  # (B,1)
+        'label': labels                       # (B,1)
+    }
+
+def train_detection(dataset, cfg):
+    """
+    DeepSpiro 구조에 맞춰 COPD Detection 모델을 학습합니다.
+    - SpiroEncoder → SpiroExplainer
+    - BCEWithLogitsLoss 사용
+    - epoch별 및 전체 학습 시간 측정
+    """
+    td_cfg = cfg['train']
+    device = torch.device(td_cfg['device'] if torch.cuda.is_available() else 'cpu')
+    batch_size = int(cfg['data']['batch_size'])
+    epochs     = int(cfg['train']['epochs_detection'])
+    lr         = float(cfg['train']['learning_rate'])
+    test_size  = float(cfg['train']['test_size'])
+    seed       = int(cfg['train']['random_seed'])
+
+    # 데이터 분할: train/val
+    total_len = len(dataset)
+    val_len   = int(total_len * test_size)
+    train_len = total_len - val_len
+    train_set, val_set = random_split(dataset, [train_len, val_len],
+                                      generator=torch.Generator().manual_seed(seed))
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_fn
     )
-    # ────────────────────────────────────────────────────────────────────────
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
 
-    # 학습/검증 분할 (80% train, 20% val) → 인덱스 섞어서 분리
-    n_total = len(dataset)
-    indices = np.arange(n_total)
-    np.random.seed(0)
-    np.random.shuffle(indices)
-    split = int(0.8 * n_total)
-    train_idx, val_idx = indices[:split], indices[split:]
-
-    train_set = torch.utils.data.Subset(dataset, train_idx)
-    val_set   = torch.utils.data.Subset(dataset, val_idx)
-    train_loader = DataLoader(train_set, batch_size=cfg['data']['batch_size'], shuffle=True, num_workers=0)
-    val_loader   = DataLoader(val_set,   batch_size=cfg['data']['batch_size'], shuffle=False, num_workers=0)
-
-    # 2) SpiroEncoder & SpiroExplainer 생성
+    # 모델 초기화
     encoder = SpiroEncoder(
         net1d_channels=cfg['model']['net1d_channels'],
-        lstm_hidden_size=cfg['model']['lstm_hidden_size'],
-        patch_length=cfg['data']['patch_length']
+        lstm_hidden=cfg['model']['lstm_hidden_size']
     ).to(device)
 
     explainer = SpiroExplainer(
-        encoder_output_dim=encoder.out_dim,
-        attention_dim=cfg['model']['attention_dim'],
-        clinical_feat_dim=4
+        encoder_dim=encoder.encoder_dim,
+        demo_dim=3,
+        hidden_dim=cfg['model']['explainer_hidden_dim']
     ).to(device)
 
-    # Neural 부분 optimizer, loss 정의
-    params = list(encoder.parameters()) + list(explainer.fc_logits.parameters())
-    optimizer = torch.optim.Adam(params, lr=cfg['train']['learning_rate'])
-    criterion = torch.nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(
+        list(encoder.parameters()) + list(explainer.parameters()),
+        lr=lr
+    )
 
-    # 3) Neural Network 학습 루프
-    for epoch in range(cfg['train']['epochs_detection']):
+    best_auc = 0.0
+    os.makedirs(cfg['output']['checkpoint_dir'], exist_ok=True)
+    os.makedirs(cfg['output']['figures_dir'], exist_ok=True)
+
+    print(f"▶️ Using device: {device}")
+    print(f"▶️ Detection 학습 시작 시각: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    total_start_time = time.time()
+    for epoch in range(1, epochs+1):
+        epoch_start_time = time.time()
+
         encoder.train()
         explainer.train()
-        total_loss = 0.0
+        epoch_losses = []
 
-        for batch in train_loader:
-            flow_patches = batch['flow_patches'].to(device)   # (b, n_patches, 1, patch_length)
-            mask         = batch['mask'].to(device)           # (b, n_patches)
-            seq_len      = batch['seq_len'].to(device)        # (b,)
-            label        = batch['label'].to(device)          # (b,1)
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [Train]"):
+            flow_patches = batch['flow_patches'].to(device)  # (B, n_patches, 1, patch_len)
+            mask         = batch['mask'].to(device)          # (B, n_patches)
+            age          = batch['age'].to(device)           # (B,1)
+            sex          = batch['sex'].to(device)           # (B,1)
+            smoking      = batch['smoking'].to(device)       # (B,1)
+            label        = batch['label'].to(device)         # (B,1)
 
-            lstm_out = encoder(flow_patches, mask, seq_len)   # (b, n_patches, 2*lstm_hidden)
-            prob_neural, _ = explainer(lstm_out, None, seq_len)  # (b,)
-
-            # BCEWithLogitsLoss를 쓰려면 sigmoid → logit, 즉 torch.logit()
-            loss = criterion(torch.logit(prob_neural), label.squeeze(-1))
             optimizer.zero_grad()
+            enc_feat = encoder(flow_patches, mask)              # (B, encoder_dim)
+            y_logit = explainer(enc_feat, age, sex, smoking)    # (B,)
+            loss = criterion(y_logit, label.squeeze(1))
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
+            epoch_losses.append(loss.item())
 
-        avg_loss = total_loss / len(train_loader)
-        print(f"[Epoch {epoch+1}/{cfg['train']['epochs_detection']}] Neural Loss: {avg_loss:.4f}")
-
-    # 4) Neural 학습 완료 후, train set 전체 순회하며 neural_prob + 구조화 임상 정보 획득 → CatBoost 학습 데이터 구성
-    encoder.eval()
-    explainer.eval()
-
-    train_features, train_labels = [], []
-    for batch in train_loader:
+        # ───────────────────────────────────────────────────────────────────
+        # 검증 루프
+        encoder.eval()
+        explainer.eval()
+        y_true_list = []
+        y_prob_list = []
         with torch.no_grad():
-            flow_patches = batch['flow_patches'].to(device)
-            mask         = batch['mask'].to(device)
-            seq_len      = batch['seq_len'].to(device)
-            age          = batch['age'].cpu().numpy().reshape(-1, 1)
-            sex          = batch['sex'].cpu().numpy().reshape(-1, 1)
-            smoking      = batch['smoking'].cpu().numpy().reshape(-1, 1)
-            fev1fvc      = batch['fev1fvc'].cpu().numpy().reshape(-1, 1)
-            label        = batch['label'].cpu().numpy().reshape(-1, 1)
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch}/{epochs} [Valid]"):
+                flow_patches = batch['flow_patches'].to(device)
+                mask         = batch['mask'].to(device)
+                age          = batch['age'].to(device)
+                sex          = batch['sex'].to(device)
+                smoking      = batch['smoking'].to(device)
+                label        = batch['label'].to(device)
 
-            lstm_out = encoder(flow_patches, mask, seq_len)
-            prob_neural, weighted_feat = explainer(lstm_out, None, seq_len)
+                enc_feat = encoder(flow_patches, mask)
+                y_logit  = explainer(enc_feat, age, sex, smoking)
+                y_prob   = torch.sigmoid(y_logit)
 
-            neural_prob_np = prob_neural.cpu().numpy().reshape(-1, 1)
-            clinical_np = np.concatenate([age, sex, smoking, fev1fvc], axis=1)  # (b,4)
-            features = np.concatenate([neural_prob_np, clinical_np], axis=1)    # (b,5)
+                y_true   = label.squeeze(1).cpu().numpy()   # (B,)
+                y_prob_np= y_prob.cpu().numpy()             # (B,)
 
-            train_features.append(features)
-            train_labels.append(label)
+                y_true_list.append(y_true)
+                y_prob_list.append(y_prob_np)
 
-    train_features = np.vstack(train_features)   # (n_train,5)
-    train_labels   = np.vstack(train_labels).ravel()  # (n_train,)
+        y_true_all = np.concatenate(y_true_list)  # (val_len,)
+        y_prob_all = np.concatenate(y_prob_list)  # (val_len,)
+        y_pred_all = (y_prob_all >= 0.5).astype(int)
 
-    # 5) CatBoostClassifier 학습 (Detection)
-    catboost_model = CatBoostClassifier(iterations=500, learning_rate=0.05, depth=4, verbose=False)
-    print(">>> CatBoost Detection 모델 학습 시작...")
-    catboost_model.fit(train_features, train_labels, verbose=False)
-    print(">>> CatBoost 학습 완료.")
+        metrics = compute_metrics(y_true_all, y_pred_all, y_prob_all)
+        avg_loss = np.mean(epoch_losses)
+        epoch_duration = time.time() - epoch_start_time
 
-    # 학습된 CatBoost 모델 저장
-    os.makedirs(cfg['output']['checkpoint_dir'], exist_ok=True)
-    det_path = os.path.join(cfg['output']['checkpoint_dir'], "SpiroExplainer.cbm")
-    catboost_model.save_model(det_path)
-    print("CatBoost Detection 모델 저장 위치:", det_path)
+        print(f"[Epoch {epoch}/{epochs}] "
+              f"loss: {avg_loss:.4f} | AUROC: {metrics['auroc']:.4f} | "
+              f"AUPRC: {metrics['auprc']:.4f} | F1: {metrics['f1']:.4f} | "
+              f"Epoch Time: {epoch_duration:.1f}s")
 
-    # 6) 검증 세트 예측 및 지표 계산
-    val_features, val_labels = [], []
-    for batch in val_loader:
-        with torch.no_grad():
-            flow_patches = batch['flow_patches'].to(device)
-            mask         = batch['mask'].to(device)
-            seq_len      = batch['seq_len'].to(device)
-            age          = batch['age'].cpu().numpy().reshape(-1, 1)
-            sex          = batch['sex'].cpu().numpy().reshape(-1, 1)
-            smoking      = batch['smoking'].cpu().numpy().reshape(-1, 1)
-            fev1fvc      = batch['fev1fvc'].cpu().numpy().reshape(-1, 1)
-            label        = batch['label'].cpu().numpy().reshape(-1, 1)
+        # 모델 저장 (최고 AUROC 시)
+        if metrics['auroc'] > best_auc:
+            best_auc = metrics['auroc']
+            ckpt_path = os.path.join(cfg['output']['checkpoint_dir'], "deepspiro_detection_best.pth")
+            torch.save({
+                'encoder': encoder.state_dict(),
+                'explainer': explainer.state_dict(),
+                'best_auc': best_auc
+            }, ckpt_path)
 
-            lstm_out = encoder(flow_patches, mask, seq_len)
-            prob_neural, weighted_feat = explainer(lstm_out, None, seq_len)
+    total_duration = time.time() - total_start_time
+    print(f"▶️ 전체 Detection 학습 완료 시각: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"▶️ 전체 Detection 학습 시간: {total_duration:.1f}s ({total_duration/60:.2f}분)")
 
-            neural_prob_np = prob_neural.cpu().numpy().reshape(-1, 1)
-            clinical_np = np.concatenate([age, sex, smoking, fev1fvc], axis=1)
-            features = np.concatenate([neural_prob_np, clinical_np], axis=1)
+    # ROC/PR 그래프 저장
+    plot_roc(y_true_all, y_prob_all, save_path=os.path.join(cfg['output']['figures_dir'], "roc_detection.png"))
+    plot_pr(y_true_all, y_prob_all, save_path=os.path.join(cfg['output']['figures_dir'], "pr_detection.png"))
+    print("▶️ Detection 모델 및 ROC/PR 곡선 저장 완료")
 
-            val_features.append(features)
-            val_labels.append(label)
-
-    val_features = np.vstack(val_features)   # (n_val,5)
-    val_labels   = np.vstack(val_labels).ravel()  # (n_val,)
-
-    val_preds = catboost_model.predict_proba(val_features)[:, 1]
-    auroc = roc_auc_score(val_labels, val_preds)
-    auprc = average_precision_score(val_labels, val_preds)
-    f1 = f1_score(val_labels, (val_preds > 0.5).astype(int))
-
-    print(f"[검증] Detection AUROC: {auroc:.4f}, AUPRC: {auprc:.4f}, F1-score: {f1:.4f}")
-
-    return encoder, explainer, catboost_model
+    return {'encoder': encoder, 'explainer': explainer}
