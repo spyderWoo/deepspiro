@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from model.spiro_encoder import SpiroEncoder
 from model.spiro_explainer import SpiroExplainer
-from model.spiro_predictor import compute_concavity
+from model.spiro_predictor import compute_concavity_features
 from catboost import CatBoostClassifier
 
 def load_models(checkpoint_dir, cfg):
@@ -23,8 +23,7 @@ def load_models(checkpoint_dir, cfg):
     # 1) SpiroEncoder 로드
     encoder = SpiroEncoder(
         net1d_channels=cfg['model']['net1d_channels'],
-        lstm_hidden_size=cfg['model']['lstm_hidden_size'],
-        patch_length=cfg['data']['patch_length']
+        lstm_hidden=cfg['model']['lstm_hidden_size']
     ).to(device)
     encoder_path = os.path.join(checkpoint_dir, "SpiroEncoder.pth")
     encoder.load_state_dict(torch.load(encoder_path, map_location=device))
@@ -32,9 +31,9 @@ def load_models(checkpoint_dir, cfg):
 
     # 2) SpiroExplainer 인스턴스 생성 (네트워크 부분만 사용)
     explainer = SpiroExplainer(
-        encoder_output_dim=encoder.out_dim,
-        attention_dim=cfg['model']['attention_dim'],
-        clinical_feat_dim=4
+        encoder_dim=encoder.encoder_dim,
+        demo_dim=3,
+        hidden_dim=cfg['model']['explainer_hidden_dim']
     ).to(device)
     explainer.eval()
 
@@ -66,10 +65,13 @@ def predict_copd(sample_flow_patches, sample_clinical_feats,
     # 1) Neural 탐지 확률 계산
     with torch.no_grad():
         sample_flow_patches = sample_flow_patches.to(device)
-        seq_len = torch.tensor([sample_flow_patches.size(1)], dtype=torch.long).to(device)
-        mask = torch.ones(seq_len.item(), dtype=torch.float32).unsqueeze(0).to(device)
-        lstm_out = encoder(sample_flow_patches, mask, seq_len)
-        prob_neural, weighted_feat = explainer(lstm_out, None, seq_len)
+        mask = torch.ones((1, sample_flow_patches.size(1)), dtype=torch.float32).to(device)
+        enc_feat = encoder(sample_flow_patches, mask)
+        age = torch.tensor(sample_clinical_feats[:,0:1], dtype=torch.float32).to(device)
+        sex = torch.tensor(sample_clinical_feats[:,1:2], dtype=torch.float32).to(device)
+        smoking = torch.tensor(sample_clinical_feats[:,2:3], dtype=torch.float32).to(device)
+        logit = explainer(enc_feat, age, sex, smoking)
+        prob_neural = torch.sigmoid(logit)
 
     neural_prob = prob_neural.cpu().numpy().item()
 
@@ -81,11 +83,7 @@ def predict_copd(sample_flow_patches, sample_clinical_feats,
     prob_copd = catboost_detection.predict_proba(detection_input)[:,1].item()
 
     # 3) Concavity 계산 → CatBoost Prediction 예측
-    #    sample_flow_patches → 1D flow 배열로 복원 후 flow_time 생성
-    flow_array = sample_flow_patches.squeeze(0).view(-1).cpu().numpy()
-    flow_time  = np.arange(len(flow_array), dtype=np.float32)
-
-    concavity_vals = compute_concavity(flow_array, flow_time, sample_clinical_feats[0,3])
+    concavity_vals = compute_concavity_features(sample_flow_patches, cfg['data']['patch_length']).cpu().numpy()[0]
     pred_input = np.concatenate([
         np.array([[neural_prob, *sample_clinical_feats.flatten()]]),  # (1,5)
         concavity_vals.reshape(1,4)                                   # (1,4)
